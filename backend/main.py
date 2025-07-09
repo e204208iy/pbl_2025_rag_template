@@ -1,12 +1,16 @@
 import os
+import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langchain_openai import ChatOpenAI
-from langchain.chains import ConversationChain
-from langchain.memory import ConversationBufferMemory
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
+
+# LangChainの関連モジュール
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.chains import LLMChain
+from langchain.callbacks.streaming_aiter import AsyncIteratorCallbackHandler
 
 # .envファイルから環境変数を読み込む
 load_dotenv()
@@ -14,8 +18,7 @@ load_dotenv()
 # FastAPIアプリケーションのインスタンスを作成
 app = FastAPI()
 
-# CORS (Cross-Origin Resource Sharing) の設定
-# フロントエンド(React)からのリクエストを許可する
+# CORS設定
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -24,31 +27,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# LangChainの設定
-# temperature=0で、より決定的で一貫した応答を生成
-llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0,
-    openai_api_key=os.getenv("OPENAI_API_KEY")
-)
-# 会話履歴を保存するメモリ
-memory = ConversationBufferMemory()
-# メモリとLLMを組み合わせた会話チェーン
-conversation = ConversationChain(llm=llm, memory=memory, verbose=True)
-
-# フロントエンドから受け取るデータモデルを定義
-class Message(BaseModel):
+# --- 修正点 1: historyを削除 ---
+# フロントエンドから受け取るデータモデルを単純化
+class ChatRequest(BaseModel):
     text: str
 
-# 応答をストリーミングするための非同期ジェネレータ関数
-async def stream_generator(user_input: str):
-    # LangChainのastream（非同期ストリーム）を使って応答をチャンクで取得
-    async for chunk in conversation.astream({"input": user_input}):
-        if "response" in chunk:
-            yield chunk["response"]
 
-# チャット用のAPIエンドポイント
+# ストリーミング応答を生成するジェネレータ関数
+# --- 修正点 2: history引数を削除 ---
+async def stream_generator(user_input: str):
+    # コールバックハンドラはリクエストごとに新しいインスタンスを作成
+    callback = AsyncIteratorCallbackHandler()
+
+    # LLMの初期化
+    # streaming=Trueとcallbacks=[callback]がストリーミングの鍵
+    llm = ChatOpenAI(
+        model="gpt-3.5-turbo",
+        temperature=0,
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        streaming=True,
+        callbacks=[callback],
+    )
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are a helpful chatbot."),
+        ("human", "{input}"),
+    ])
+
+    chain = LLMChain(llm=llm, prompt=prompt, verbose=True)
+
+    # LLMの実行をバックグラウンドタスクとして開始
+    task = asyncio.create_task(
+        chain.acall({"input": user_input})
+    )
+
+    # コールバックハンドラからトークンを一つずつ取得してyieldする
+    try:
+        async for token in callback.aiter():
+            yield token
+    except Exception as e:
+        print(f"ストリームの途中でエラーが発生しました: {e}")
+    finally:
+        # タスクの完了を待つ
+        await task
+
 @app.post("/chat")
-async def chat_stream(message: Message):
+async def chat_stream(request: ChatRequest):
     # StreamingResponseを使って、ジェネレータからの出力をリアルタイムで送信
-    return StreamingResponse(stream_generator(message.text), media_type="text/event-stream")
+    # --- 修正点 6: historyを渡さないように変更 ---
+    return StreamingResponse(
+        stream_generator(request.text),
+        media_type="text/plain"
+    )
